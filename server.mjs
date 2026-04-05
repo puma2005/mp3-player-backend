@@ -2,7 +2,6 @@ import 'dotenv/config';
 import {
   DeleteObjectCommand,
   GetObjectCommand,
-  HeadObjectCommand,
   ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
@@ -132,24 +131,6 @@ const listTrackKeys = async () => {
     .map((item) => item.Key)
     .filter((key) => key && key !== tracksPrefix && !key.endsWith('/'))
     .filter((key) => !key.endsWith('.gitkeep'));
-};
-
-const objectExists = async (key) => {
-  try {
-    await s3.send(
-      new HeadObjectCommand({
-        Bucket: bucketName,
-        Key: key,
-      })
-    );
-    return true;
-  } catch (error) {
-    const code = error?.Code || error?.name;
-    if (code === 'NotFound' || code === 'NoSuchKey') {
-      return false;
-    }
-    throw error;
-  }
 };
 
 const syncPlaylist = async () => {
