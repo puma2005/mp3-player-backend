@@ -1,43 +1,12 @@
 import 'dotenv/config';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
-import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
-
-const required = [
-  'R2_ACCOUNT_ID',
-  'R2_ACCESS_KEY_ID',
-  'R2_SECRET_ACCESS_KEY',
-  'R2_BUCKET_NAME',
-  'R2_PUBLIC_BASE_URL',
-];
-
-const missing = required.filter((key) => !process.env[key]);
-
-if (missing.length) {
-  console.error(`Eksik env degiskenleri: ${missing.join(', ')}`);
-}
 
 const app = express();
 const port = Number(process.env.PORT || 8080);
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 200 * 1024 * 1024,
-  },
-});
-
-const s3 = new S3Client({
-  region: 'auto',
-  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID || '',
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',
-  },
-});
-
-const bucketName = process.env.R2_BUCKET_NAME || 'mp3-player-assets';
-const publicBaseUrl = (process.env.R2_PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 const uploadToken = process.env.UPLOAD_TOKEN || 'serkan2026yukle';
 const defaultArtist = process.env.DEFAULT_ARTIST || 'Serkan Saver';
 const defaultCoverUrl =
@@ -46,15 +15,41 @@ const defaultCoverUrl =
 const playlistName = process.env.PLAYLIST_NAME || 'Serkan Saver 2026';
 const playlistDescription = process.env.PLAYLIST_DESCRIPTION || 'Serkan Saver parcalarinin online listesi.';
 
+const dataDir = path.join(process.cwd(), 'data');
+const uploadsDir = path.join(dataDir, 'uploads');
+const playlistFile = path.join(dataDir, 'playlist.json');
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 200 * 1024 * 1024,
+  },
+});
+
 app.use(cors());
 app.use(express.json());
+app.use('/media', express.static(uploadsDir, { fallthrough: false }));
 
-const streamToText = async (stream) => {
-  const chunks = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+const ensureStorage = async () => {
+  await fs.mkdir(uploadsDir, { recursive: true });
+
+  try {
+    await fs.access(playlistFile);
+  } catch {
+    await fs.writeFile(
+      playlistFile,
+      JSON.stringify(
+        {
+          name: playlistName,
+          description: playlistDescription,
+          updatedAt: new Date().toISOString(),
+          tracks: [],
+        },
+        null,
+        2
+      )
+    );
   }
-  return Buffer.concat(chunks).toString('utf8');
 };
 
 const slugify = (value) =>
@@ -80,45 +75,40 @@ const extensionFromName = (value) => {
 };
 
 const readPlaylist = async () => {
-  try {
-    const result = await s3.send(new GetObjectCommand({ Bucket: bucketName, Key: 'playlist.json' }));
-    const text = await streamToText(result.Body);
-    return JSON.parse(text);
-  } catch {
-    return {
-      name: playlistName,
-      description: playlistDescription,
-      updatedAt: new Date().toISOString(),
-      tracks: [],
-    };
-  }
+  await ensureStorage();
+  const text = await fs.readFile(playlistFile, 'utf8');
+  return JSON.parse(text);
 };
 
 const writePlaylist = async (playlist) => {
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: bucketName,
-      Key: 'playlist.json',
-      Body: JSON.stringify(playlist, null, 2),
-      ContentType: 'application/json; charset=utf-8',
-      CacheControl: 'no-store, no-cache, max-age=0, must-revalidate',
-    })
-  );
+  await ensureStorage();
+  await fs.writeFile(playlistFile, JSON.stringify(playlist, null, 2));
 };
 
-app.get('/health', (_req, res) => {
+app.get('/health', async (_req, res) => {
+  await ensureStorage();
   res.json({
     ok: true,
     service: 'mp3-player-backend',
+    storage: 'local',
     date: new Date().toISOString(),
   });
 });
 
-app.get('/playlist', async (_req, res) => {
+app.get('/playlist', async (req, res) => {
   try {
     const playlist = await readPlaylist();
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const hydrated = {
+      ...playlist,
+      tracks: playlist.tracks.map((track) => ({
+        ...track,
+        audioUrl: `${baseUrl}/${track.audioPath}`,
+      })),
+    };
+
     res.set('Cache-Control', 'no-store, no-cache, max-age=0, must-revalidate');
-    res.json(playlist);
+    res.json(hydrated);
   } catch (error) {
     res.status(500).json({
       error: error instanceof Error ? error.message : 'Playlist okunamadi.',
@@ -137,6 +127,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Dosya bulunamadi.' });
     }
 
+    await ensureStorage();
+
     const artist = String(req.body.artist || defaultArtist).trim() || defaultArtist;
     const requestedTitle = String(req.body.title || '').trim();
     const duration = String(req.body.duration || '00:00').trim() || '00:00';
@@ -144,17 +136,11 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     const extension = extensionFromName(originalName);
     const title = requestedTitle || titleFromFilename(originalName);
     const id = slugify(`${artist}-${title}-${Date.now()}`) || `track-${Date.now()}`;
-    const objectKey = `tracks/${id}.${extension}`;
-    const audioUrl = `${publicBaseUrl}/${objectKey}`;
+    const fileName = `${id}.${extension}`;
+    const filePath = path.join(uploadsDir, fileName);
+    const audioPath = `media/${fileName}`;
 
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: bucketName,
-        Key: objectKey,
-        Body: req.file.buffer,
-        ContentType: req.file.mimetype || 'application/octet-stream',
-      })
-    );
+    await fs.writeFile(filePath, req.file.buffer);
 
     const playlist = await readPlaylist();
     const track = {
@@ -162,7 +148,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       title,
       artist,
       coverUrl: defaultCoverUrl,
-      audioUrl,
+      audioPath,
       duration,
     };
 
@@ -172,7 +158,10 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
     return res.json({
       ok: true,
-      track,
+      track: {
+        ...track,
+        audioUrl: `${req.protocol}://${req.get('host')}/${audioPath}`,
+      },
     });
   } catch (error) {
     return res.status(500).json({
@@ -181,6 +170,13 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-app.listen(port, () => {
-  console.log(`Backend hazir: http://localhost:${port}`);
-});
+ensureStorage()
+  .then(() => {
+    app.listen(port, () => {
+      console.log(`Backend hazir: http://localhost:${port}`);
+    });
+  })
+  .catch((error) => {
+    console.error('Depolama hazirlanamadi:', error);
+    process.exit(1);
+  });
