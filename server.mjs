@@ -85,6 +85,36 @@ const writePlaylist = async (playlist) => {
   await fs.writeFile(playlistFile, JSON.stringify(playlist, null, 2));
 };
 
+const fileExists = async (targetPath) => {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const getTrackFilePath = (track) => path.join(process.cwd(), track.audioPath ?? '');
+
+const syncPlaylistFiles = async () => {
+  const playlist = await readPlaylist();
+  const keptTracks = [];
+
+  for (const track of playlist.tracks) {
+    if (!track.audioPath) continue;
+    const exists = await fileExists(getTrackFilePath(track));
+    if (exists) keptTracks.push(track);
+  }
+
+  if (keptTracks.length !== playlist.tracks.length) {
+    playlist.tracks = keptTracks;
+    playlist.updatedAt = new Date().toISOString();
+    await writePlaylist(playlist);
+  }
+
+  return playlist;
+};
+
 app.get('/health', async (_req, res) => {
   await ensureStorage();
   res.json({
@@ -97,7 +127,7 @@ app.get('/health', async (_req, res) => {
 
 app.get('/playlist', async (req, res) => {
   try {
-    const playlist = await readPlaylist();
+    const playlist = await syncPlaylistFiles();
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     const hydrated = {
       ...playlist,
@@ -112,6 +142,39 @@ app.get('/playlist', async (req, res) => {
   } catch (error) {
     res.status(500).json({
       error: error instanceof Error ? error.message : 'Playlist okunamadi.',
+    });
+  }
+});
+
+app.delete('/tracks/:id', async (req, res) => {
+  try {
+    const token = req.header('x-upload-token');
+    if (!token || token !== uploadToken) {
+      return res.status(401).json({ error: 'Yetkisiz silme denemesi.' });
+    }
+
+    const playlist = await readPlaylist();
+    const trackIndex = playlist.tracks.findIndex((track) => track.id === req.params.id);
+
+    if (trackIndex === -1) {
+      return res.status(404).json({ error: 'Sarki bulunamadi.' });
+    }
+
+    const [track] = playlist.tracks.splice(trackIndex, 1);
+    if (track?.audioPath) {
+      await fs.rm(getTrackFilePath(track), { force: true }).catch(() => undefined);
+    }
+
+    playlist.updatedAt = new Date().toISOString();
+    await writePlaylist(playlist);
+
+    return res.json({
+      ok: true,
+      removedId: req.params.id,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Silme sirasinda hata oldu.',
     });
   }
 });
